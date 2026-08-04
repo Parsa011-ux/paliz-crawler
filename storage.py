@@ -1,5 +1,5 @@
 """
-ذخیره‌سازی اخبار در Turso (SQLite ابری) - libsql
+ذخیره‌سازی اخبار در Turso (SQLite ابری)
 =====================================================
 """
 import hashlib
@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
-import libsql
+import libsql_experimental as libsql
 
 from config import Config
 from rss_parser import NewsItem
@@ -65,20 +65,13 @@ def init_db():
     logger.info("✅ Turso database آماده است")
 
 
-# ============================================================
-# هش عنوان
-# ============================================================
 def _title_hash(title: str) -> str:
     normalized = re.sub(r"[^\w\s]", "", title.lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-# تشخیص تکراری
-# ============================================================
 def is_duplicate(item: NewsItem) -> tuple[bool, str]:
-    """بررسی آیا خبر قبلاً ذخیره شده."""
     conn = get_client()
     
     result = conn.execute(
@@ -100,7 +93,6 @@ def is_duplicate(item: NewsItem) -> tuple[bool, str]:
 
 
 def filter_new_items(items: list[NewsItem]) -> list[NewsItem]:
-    """فیلتر اخبار جدید (غیرتکراری)."""
     url_seen = set()
     hash_seen = set()
     unique = []
@@ -123,9 +115,6 @@ def filter_new_items(items: list[NewsItem]) -> list[NewsItem]:
     return new_items
 
 
-# ============================================================
-# ذخیره خبر جدید
-# ============================================================
 def save_article(
     item: NewsItem,
     title_fa: str,
@@ -137,7 +126,6 @@ def save_article(
     content_fa: str = "",
     image_url: str | None = None,
 ) -> int | None:
-    """ذخیره یک خبر جدید."""
     try:
         slug = generate_unique_slug(title_fa, item.title_clean)
         conn = get_client()
@@ -182,11 +170,7 @@ def save_article(
         return None
 
 
-# ============================================================
-# پاکسازی
-# ============================================================
 def cleanup_old_articles(keep_days: int = 60) -> int:
-    """حذف اخبار قدیمی."""
     cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
     conn = get_client()
     conn.execute("DELETE FROM articles WHERE created_at < ?", (cutoff,))
@@ -194,9 +178,6 @@ def cleanup_old_articles(keep_days: int = 60) -> int:
     return 0
 
 
-# ============================================================
-# آمار
-# ============================================================
 def get_stats() -> dict:
     conn = get_client()
     total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
