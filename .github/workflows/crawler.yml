@@ -1,11 +1,8 @@
-name: 🕷️ Paliz News Crawler
+name: 🕷️ Paliz News Crawler + Auto Rebuild
 
 on:
   schedule:
-    # هر 15 دقیقه اجرا می‌شود
-    - cron: '*/15 * * * *'
-  
-  # اجازه اجرای دستی از GitHub
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -38,3 +35,10 @@ jobs:
           SCRAPE_FULL_CONTENT: 'true'
           LOG_LEVEL: 'INFO'
         run: python main.py --once
+      
+      - name: 🔄 Trigger Cloudflare Rebuild
+        if: success()
+        run: |
+          echo "🚀 Triggering Cloudflare rebuild..."
+          curl -s -X POST "${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}"
+          echo "✅ Site rebuild triggered!"
