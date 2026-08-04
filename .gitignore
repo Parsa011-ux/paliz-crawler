@@ -1,0 +1,30 @@
+# Environment
+.env
+.env.local
+
+# Virtual Environment
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+news_bot.db
+paliz_news.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
