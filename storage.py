@@ -1,13 +1,15 @@
 """
-ذخیره‌سازی اخبار در Turso (SQLite ابری)
+ذخیره‌سازی اخبار در Turso با HTTP API
 =====================================================
+از HTTP API استفاده می‌کنیم تا روی همه پلتفرم‌ها کار کنه
 """
 import hashlib
 import logging
 import re
 from datetime import datetime, timedelta
+from typing import Any
 
-import libsql_experimental as libsql
+import requests
 
 from config import Config
 from rss_parser import NewsItem
@@ -17,20 +19,105 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# اتصال به Turso
+# Turso HTTP Client
 # ============================================================
-def get_client():
+class TursoClient:
+    def __init__(self, url: str, auth_token: str):
+        # تبدیل libsql:// به https://
+        self.base_url = url.replace("libsql://", "https://")
+        self.auth_token = auth_token
+        self.headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+        }
+    
+    def execute(self, sql: str, params: list = None) -> dict:
+        """اجرای یک کوئری روی Turso."""
+        if params is None:
+            params = []
+        
+        # تبدیل params به فرمت Turso
+        args = []
+        for p in params:
+            if p is None:
+                args.append({"type": "null"})
+            elif isinstance(p, bool):
+                args.append({"type": "integer", "value": str(int(p))})
+            elif isinstance(p, int):
+                args.append({"type": "integer", "value": str(p)})
+            elif isinstance(p, float):
+                args.append({"type": "float", "value": p})
+            else:
+                args.append({"type": "text", "value": str(p)})
+        
+        payload = {
+            "requests": [
+                {
+                    "type": "execute",
+                    "stmt": {
+                        "sql": sql,
+                        "args": args,
+                    }
+                },
+                {"type": "close"}
+            ]
+        }
+        
+        response = requests.post(
+            f"{self.base_url}/v2/pipeline",
+            json=payload,
+            headers=self.headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def fetch_one(self, sql: str, params: list = None) -> tuple | None:
+        """گرفتن یک سطر."""
+        result = self.execute(sql, params)
+        try:
+            rows = result["results"][0]["response"]["result"]["rows"]
+            if not rows:
+                return None
+            return tuple(
+                col.get("value") if col.get("type") != "null" else None
+                for col in rows[0]
+            )
+        except (KeyError, IndexError):
+            return None
+    
+    def fetch_all(self, sql: str, params: list = None) -> list[tuple]:
+        """گرفتن همه سطرها."""
+        result = self.execute(sql, params)
+        try:
+            rows = result["results"][0]["response"]["result"]["rows"]
+            return [
+                tuple(
+                    col.get("value") if col.get("type") != "null" else None
+                    for col in row
+                )
+                for row in rows
+            ]
+        except (KeyError, IndexError):
+            return []
+
+
+def get_client() -> TursoClient:
     """ساخت client برای Turso."""
-    return libsql.connect(
-        database=Config.TURSO_DATABASE_URL,
+    return TursoClient(
+        url=Config.TURSO_DATABASE_URL,
         auth_token=Config.TURSO_AUTH_TOKEN,
     )
 
 
+# ============================================================
+# ساخت جدول
+# ============================================================
 def init_db():
     """ساخت جدول‌های مورد نیاز در Turso."""
-    conn = get_client()
-    conn.execute("""
+    client = get_client()
+    
+    client.execute("""
         CREATE TABLE IF NOT EXISTS articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slug TEXT UNIQUE NOT NULL,
@@ -55,37 +142,44 @@ def init_db():
             title_hash TEXT
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_link ON articles(normalized_link)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_slug ON articles(slug)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_hash ON articles(title_hash)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_breaking ON articles(is_breaking, created_at DESC)")
-    conn.commit()
+    
+    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_link ON articles(normalized_link)")
+    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_slug ON articles(slug)")
+    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_hash ON articles(title_hash)")
+    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)")
+    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC)")
+    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_breaking ON articles(is_breaking, created_at DESC)")
+    
     logger.info("✅ Turso database آماده است")
 
 
+# ============================================================
+# هش عنوان
+# ============================================================
 def _title_hash(title: str) -> str:
     normalized = re.sub(r"[^\w\s]", "", title.lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
 
+# ============================================================
+# تشخیص تکراری
+# ============================================================
 def is_duplicate(item: NewsItem) -> tuple[bool, str]:
-    conn = get_client()
+    client = get_client()
     
-    result = conn.execute(
+    result = client.fetch_one(
         "SELECT 1 FROM articles WHERE normalized_link = ? LIMIT 1",
-        (item.normalized_link,)
-    ).fetchone()
+        [item.normalized_link]
+    )
     if result:
         return True, "URL تکراری"
 
     t_hash = _title_hash(item.title_clean)
-    result = conn.execute(
+    result = client.fetch_one(
         "SELECT 1 FROM articles WHERE title_hash = ? LIMIT 1",
-        (t_hash,)
-    ).fetchone()
+        [t_hash]
+    )
     if result:
         return True, "عنوان تکراری"
 
@@ -115,6 +209,9 @@ def filter_new_items(items: list[NewsItem]) -> list[NewsItem]:
     return new_items
 
 
+# ============================================================
+# ذخیره خبر
+# ============================================================
 def save_article(
     item: NewsItem,
     title_fa: str,
@@ -128,16 +225,16 @@ def save_article(
 ) -> int | None:
     try:
         slug = generate_unique_slug(title_fa, item.title_clean)
-        conn = get_client()
+        client = get_client()
         
-        conn.execute("""
+        client.execute("""
             INSERT INTO articles (
                 slug, title, title_fa, summary, summary_fa,
                 content, content_fa, link, normalized_link, image_url,
                 source_name, source_name_fa, language, category,
                 importance_score, is_breaking, published_at, created_at, title_hash
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+        """, [
             slug,
             item.title_clean,
             title_fa,
@@ -157,10 +254,10 @@ def save_article(
             item.published.isoformat() if item.published else None,
             datetime.now().isoformat(),
             _title_hash(item.title_clean),
-        ))
-        conn.commit()
+        ])
         
-        result = conn.execute("SELECT last_insert_rowid()").fetchone()
+        # گرفتن id آخرین رکورد
+        result = client.fetch_one("SELECT last_insert_rowid()")
         article_id = result[0] if result else None
         
         logger.info(f"💾 ذخیره شد: {title_fa[:60]}... (id={article_id})")
@@ -170,22 +267,30 @@ def save_article(
         return None
 
 
+# ============================================================
+# پاکسازی
+# ============================================================
 def cleanup_old_articles(keep_days: int = 60) -> int:
     cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-    conn = get_client()
-    conn.execute("DELETE FROM articles WHERE created_at < ?", (cutoff,))
-    conn.commit()
+    client = get_client()
+    client.execute("DELETE FROM articles WHERE created_at < ?", [cutoff])
     return 0
 
 
+# ============================================================
+# آمار
+# ============================================================
 def get_stats() -> dict:
-    conn = get_client()
-    total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-    breaking = conn.execute("SELECT COUNT(*) FROM articles WHERE is_breaking = 1").fetchone()[0]
-    today = conn.execute(
-        "SELECT COUNT(*) FROM articles WHERE date(created_at) = date('now')"
-    ).fetchone()[0]
-    return {"total": total, "breaking": breaking, "today": today}
+    client = get_client()
+    total = client.fetch_one("SELECT COUNT(*) FROM articles")
+    breaking = client.fetch_one("SELECT COUNT(*) FROM articles WHERE is_breaking = 1")
+    today = client.fetch_one("SELECT COUNT(*) FROM articles WHERE date(created_at) = date('now')")
+    
+    return {
+        "total": int(total[0]) if total else 0,
+        "breaking": int(breaking[0]) if breaking else 0,
+        "today": int(today[0]) if today else 0,
+    }
 
 
 if __name__ == "__main__":
