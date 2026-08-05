@@ -187,7 +187,53 @@ EVAL_PROMPT = """تو یک ویراستار خبرگزاری فارسی‌زبا
 خلاصه خبر: {summary}
 منبع: {source} ({language})
 """
+# ============================================================
+# خلاصه‌سازی متن با Gemini (بدون ترجمه)
+# ============================================================
+SUMMARIZE_PROMPT = """You are a professional news summarizer. Summarize the following article in English.
 
+Requirements:
+- Length: 150-250 words
+- Keep all important facts, names, numbers, and quotes
+- Use clear, journalistic English
+- 2-3 paragraphs
+- No introductory phrases like "The article says" or "According to"
+- Just the summary itself
+
+Article title: {title}
+Article content: {content}
+
+Return ONLY the summary text, nothing else."""
+
+
+def summarize_article(title: str, content: str) -> str:
+    """خلاصه‌سازی متن مقاله با Gemini (به انگلیسی).
+    خروجی: متن خلاصه شده ~200 کلمه (~1000 کاراکتر)"""
+    if not content or len(content) < 200:
+        return content
+    
+    try:
+        model = _get_model()
+        prompt = SUMMARIZE_PROMPT.format(
+            title=title[:200],
+            content=content[:5000],  # حداکثر 5000 کاراکتر ورودی
+        )
+        
+        response = model.generate_content(prompt)
+        summary = response.text.strip() if response.text else ""
+        
+        # اگر خلاصه خیلی کوتاه بود، متن اصلی رو برگردون
+        if len(summary) < 100:
+            logger.warning("خلاصه Gemini خیلی کوتاه بود")
+            return content[:1500]
+        
+        # حداکثر 2000 کاراکتر (برای امنیت Google Translate)
+        return summary[:2000]
+    
+    except Exception as e:
+        logger.error(f"❌ خطای Gemini در خلاصه‌سازی: {e}")
+        # fallback: 1500 کاراکتر اول متن
+        return content[:1500]
 
 # ============================================================
 # ارزیابی یک خبر
