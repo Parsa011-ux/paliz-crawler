@@ -12,7 +12,7 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from ai_filter import evaluate_news, _fallback_evaluation
+from ai_filter import evaluate_news, _fallback_evaluation, summarize_article
 from config import Config
 from content_scraper import scrape_article_content
 from rss_parser import fetch_all_news
@@ -71,29 +71,45 @@ def crawl_cycle():
                 content = ""
                 content_fa = ""
                 image_url = None
-                
+
                 # اولویت 1: تصویر از RSS
                 if hasattr(item, 'image_url') and item.image_url:
                     image_url = item.image_url
                     logger.debug(f"📷 تصویر از RSS: {image_url[:60]}")
-                
-                # scrape محتوای کامل (و تصویر اگر RSS نداشت)
+
+                # scrape محتوای کامل + تصویر
                 if Config.SCRAPE_FULL_CONTENT:
-                    content, scraped_image = scrape_article_content(item.link)
-                    
+                    scraped_content, scraped_image = scrape_article_content(item.link)
+
                     # اگر عکس RSS نداشت، از عکس scrape شده استفاده کن
                     if not image_url and scraped_image:
                         image_url = scraped_image
                         logger.debug(f"📷 تصویر از scrape: {image_url[:60]}")
-                    
-                    # ترجمه محتوا اگه انگلیسی بود
-                    if content and item.language == "en":
-                        try:
-                            content_fa = translate_to_persian(content[:2000])
-                        except Exception:
-                            content_fa = ""
-                    else:
-                        content_fa = content
+
+                    if scraped_content and len(scraped_content) > 200:
+                        content = scraped_content
+
+                        if item.language == "en":
+                            try:
+                                # مرحله 1: Gemini خلاصه انگلیسی می‌کنه (5000 → ~1500 کاراکتر)
+                                logger.debug("🤖 خلاصه‌سازی با Gemini...")
+                                summarized = summarize_article(item.title_clean, content)
+
+                                # مرحله 2: Google Translate ترجمه می‌کنه (کاراکتر کم = بدون بلاک)
+                                logger.debug("🌐 ترجمه با Google Translate...")
+                                content_fa = translate_to_persian(summarized)
+
+                                if content_fa:
+                                    logger.info(f"✅ خلاصه + ترجمه موفق ({len(content_fa)} کاراکتر)")
+                                else:
+                                    logger.warning("⚠️ ترجمه خالی برگشت")
+
+                            except Exception as e:
+                                logger.warning(f"⚠️ خلاصه/ترجمه شکست خورد: {e}")
+                                content_fa = ""
+                        else:
+                            # اگر فارسی بود، همون محتوا
+                            content_fa = content
 
                 # ذخیره
                 save_article(
@@ -109,11 +125,13 @@ def crawl_cycle():
                 )
                 saved_count += 1
                 time.sleep(1)
+
             except Exception as e:
                 logger.error(f"❌ خطا در پردازش خبر: {e}")
                 continue
 
         logger.info(f"✅ {saved_count} خبر جدید ذخیره شد")
+
     except Exception as e:
         logger.error(f"❌ خطا در crawl_cycle: {e}", exc_info=True)
 
