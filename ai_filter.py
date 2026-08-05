@@ -6,6 +6,7 @@
   2. ترجمه عناوین و خلاصه‌های انگلیسی به فارسی
   3. تولید خلاصه فارسی جذاب برای تلگرام
   4. تشخیص خبر فوری (Breaking News)
+  5. خلاصه‌سازی متن کامل مقاله (جدید)
 
 سیستم چرخش کلیدها (Round-Robin):
   - چندین کلید API پشتیبانی می‌شود
@@ -187,6 +188,8 @@ EVAL_PROMPT = """تو یک ویراستار خبرگزاری فارسی‌زبا
 خلاصه خبر: {summary}
 منبع: {source} ({language})
 """
+
+
 # ============================================================
 # خلاصه‌سازی متن با Gemini (بدون ترجمه)
 # ============================================================
@@ -208,32 +211,48 @@ Return ONLY the summary text, nothing else."""
 
 def summarize_article(title: str, content: str) -> str:
     """خلاصه‌سازی متن مقاله با Gemini (به انگلیسی).
-    خروجی: متن خلاصه شده ~200 کلمه (~1000 کاراکتر)"""
+    
+    جریان کار:
+      1. محتوای کامل مقاله (حداکثر 5000 کاراکتر) به Gemini داده می‌شود
+      2. Gemini یک خلاصه 150-250 کلمه‌ای انگلیسی تولید می‌کند
+      3. خروجی حداکثر 2000 کاراکتر است (برای امنیت Google Translate)
+    
+    خروجی: متن خلاصه شده ~200 کلمه (~1000 کاراکتر)
+    در صورت خطا: 1500 کاراکتر اول متن اصلی
+    """
+    # اگر محتوا خیلی کوتاه بود، نیازی به خلاصه نیست
     if not content or len(content) < 200:
         return content
-    
+
     try:
         model = _get_model()
         prompt = SUMMARIZE_PROMPT.format(
             title=title[:200],
             content=content[:5000],  # حداکثر 5000 کاراکتر ورودی
         )
-        
+
         response = model.generate_content(prompt)
         summary = response.text.strip() if response.text else ""
-        
+
         # اگر خلاصه خیلی کوتاه بود، متن اصلی رو برگردون
         if len(summary) < 100:
-            logger.warning("خلاصه Gemini خیلی کوتاه بود")
+            logger.warning("⚠️ خلاصه Gemini خیلی کوتاه بود - fallback به متن اصلی")
             return content[:1500]
-        
+
+        logger.debug(f"✅ خلاصه Gemini: {len(content)} → {len(summary)} کاراکتر")
+
         # حداکثر 2000 کاراکتر (برای امنیت Google Translate)
         return summary[:2000]
-    
+
+    except ResourceExhausted as e:
+        logger.warning(f"⚠️ Gemini rate limit در خلاصه‌سازی: {e}")
+        return content[:1500]
+
     except Exception as e:
         logger.error(f"❌ خطای Gemini در خلاصه‌سازی: {e}")
         # fallback: 1500 کاراکتر اول متن
         return content[:1500]
+
 
 # ============================================================
 # ارزیابی یک خبر
@@ -377,7 +396,7 @@ def _fallback_evaluation(item: NewsItem) -> AIEvaluation:
 
     # کاهش برای اخبار ورزشی (معمولاً کم‌اهمیت‌تر)
     sports_keywords = ["football", "soccer", "cricket", "tennis", "basketball",
-                        "فوتبال", "کریکت", "تنیس", "بسکتبال", "لیگ", "مسابقه"]
+                       "فوتبال", "کریکت", "تنیس", "بسکتبال", "لیگ", "مسابقه"]
     title_lower = item.title_clean.lower()
     if any(kw in title_lower for kw in sports_keywords):
         base_score = max(base_score - 2, 3)
@@ -486,3 +505,9 @@ if __name__ == "__main__":
         print(f"   مرتبط: {ev.is_relevant} | فوری: {ev.is_breaking} | امتیاز: {ev.importance_score}")
         print(f"   عنوان FA: {ev.title_fa}")
         print(f"   خلاصه FA: {ev.summary_fa[:100]}")
+        
+        # تست خلاصه‌سازی
+        print(f"\n🤖 تست summarize_article...")
+        test_content = "This is a test article content that is long enough to be summarized by Gemini API."
+        result = summarize_article(item.title_clean, test_content)
+        print(f"   خلاصه: {result[:100]}...")
