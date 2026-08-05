@@ -1,362 +1,222 @@
 """
-ذخیره‌سازی اخبار در Turso با HTTP API
-=====================================================
-از HTTP API استفاده می‌کنیم تا روی همه پلتفرم‌ها کار کنه
+پالیز نیوز - Crawler اصلی
+==========================
+اجرای یکباره: python main.py --once
+اجرای مداوم: python main.py
 """
-import hashlib
 import logging
-import re
-from datetime import datetime, timedelta
-from typing import Any
+import sys
+import time
+from datetime import datetime
 
-import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
+from ai_filter import evaluate_news, _fallback_evaluation, summarize_article
 from config import Config
-from rss_parser import NewsItem
-from slug_generator import generate_unique_slug
+from content_scraper import scrape_article_content
+from rss_parser import fetch_all_news
+from storage import (
+    cleanup_old_articles, cleanup_old_content, filter_new_items,
+    get_stats, init_db, save_article,
+)
+from translator import translate_to_persian
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("paliz-news")
 
 
-# ============================================================
-# Turso HTTP Client
-# ============================================================
-class TursoClient:
-    def __init__(self, url: str, auth_token: str):
-        # تبدیل libsql:// به https://
-        self.base_url = url.replace("libsql://", "https://")
-        self.auth_token = auth_token
-        self.headers = {
-            "Authorization": f"Bearer {auth_token}",
-            "Content-Type": "application/json",
-        }
-    
-    def execute(self, sql: str, params: list = None) -> dict:
-        """اجرای یک کوئری روی Turso."""
-        if params is None:
-            params = []
-        
-        # تبدیل params به فرمت Turso
-        args = []
-        for p in params:
-            if p is None:
-                args.append({"type": "null"})
-            elif isinstance(p, bool):
-                args.append({"type": "integer", "value": str(int(p))})
-            elif isinstance(p, int):
-                args.append({"type": "integer", "value": str(p)})
-            elif isinstance(p, float):
-                args.append({"type": "float", "value": p})
-            else:
-                args.append({"type": "text", "value": str(p)})
-        
-        payload = {
-            "requests": [
-                {
-                    "type": "execute",
-                    "stmt": {
-                        "sql": sql,
-                        "args": args,
-                    }
-                },
-                {"type": "close"}
-            ]
-        }
-        
-        response = requests.post(
-            f"{self.base_url}/v2/pipeline",
-            json=payload,
-            headers=self.headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    def fetch_one(self, sql: str, params: list = None) -> tuple | None:
-        """گرفتن یک سطر."""
-        result = self.execute(sql, params)
-        try:
-            rows = result["results"][0]["response"]["result"]["rows"]
-            if not rows:
-                return None
-            return tuple(
-                col.get("value") if col.get("type") != "null" else None
-                for col in rows[0]
-            )
-        except (KeyError, IndexError):
-            return None
-    
-    def fetch_all(self, sql: str, params: list = None) -> list[tuple]:
-        """گرفتن همه سطرها."""
-        result = self.execute(sql, params)
-        try:
-            rows = result["results"][0]["response"]["result"]["rows"]
-            return [
-                tuple(
-                    col.get("value") if col.get("type") != "null" else None
-                    for col in row
+def crawl_cycle():
+    """یک سیکل کامل: دریافت + فیلتر + ذخیره."""
+    logger.info("📰 شروع سیکل جمع‌آوری اخبار...")
+    try:
+        # 1. دریافت اخبار
+        items = fetch_all_news(timeout=15)
+        if not items:
+            logger.info("   خبر جدیدی نبود")
+            return
+
+        # 2. حذف تکراری
+        new_items = filter_new_items(items)
+        if not new_items:
+            logger.info("   همه اخبار تکراری بودند")
+            return
+
+        # 3. مرتب‌سازی و انتخاب بهترین‌ها با fallback (رایگان)
+        evaluated_basic = [(it, _fallback_evaluation(it)) for it in new_items]
+        evaluated_basic.sort(key=lambda x: x[1].importance_score, reverse=True)
+        top_news = evaluated_basic[:Config.MAX_NEWS_PER_CYCLE]
+
+        logger.info(f"📊 {len(top_news)} خبر برتر برای ذخیره‌سازی")
+
+        # 4. برای هر خبر: AI evaluation + scrape + save
+        saved_count = 0
+        for item, fallback_ev in top_news:
+            try:
+                # ارزیابی با Gemini
+                try:
+                    ev = evaluate_news(item)
+                except Exception:
+                    ev = fallback_ev
+
+                if not ev.is_relevant:
+                    logger.debug(f"⏭ نامرتبط: {item.title_clean[:50]}")
+                    continue
+
+                # استخراج تصویر و محتوا
+                content = ""
+                content_fa = ""
+                image_url = None
+
+                # اولویت 1: تصویر از RSS
+                if hasattr(item, 'image_url') and item.image_url:
+                    image_url = item.image_url
+                    logger.debug(f"📷 تصویر از RSS: {image_url[:60]}")
+
+                # scrape محتوای کامل + تصویر
+                if Config.SCRAPE_FULL_CONTENT:
+                    scraped_content, scraped_image = scrape_article_content(item.link)
+
+                    # اگر عکس RSS نداشت، از عکس scrape شده استفاده کن
+                    if not image_url and scraped_image:
+                        image_url = scraped_image
+                        logger.debug(f"📷 تصویر از scrape: {image_url[:60]}")
+
+                    if scraped_content and len(scraped_content) > 200:
+                        content = scraped_content
+
+                        if item.language == "en":
+                            try:
+                                # مرحله 1: Gemini خلاصه انگلیسی می‌کنه (5000 → ~1500 کاراکتر)
+                                logger.debug("🤖 خلاصه‌سازی با Gemini...")
+                                summarized = summarize_article(item.title_clean, content)
+
+                                # مرحله 2: Google Translate ترجمه می‌کنه (کاراکتر کم = بدون بلاک)
+                                logger.debug("🌐 ترجمه با Google Translate...")
+                                content_fa = translate_to_persian(summarized)
+
+                                if content_fa:
+                                    logger.info(f"✅ خلاصه + ترجمه موفق ({len(content_fa)} کاراکتر)")
+                                else:
+                                    logger.warning("⚠️ ترجمه خالی برگشت")
+
+                            except Exception as e:
+                                logger.warning(f"⚠️ خلاصه/ترجمه شکست خورد: {e}")
+                                content_fa = ""
+                        else:
+                            # اگر فارسی بود، همون محتوا
+                            content_fa = content
+
+                # ذخیره
+                save_article(
+                    item=item,
+                    title_fa=ev.title_fa,
+                    summary_fa=ev.summary_fa,
+                    category=ev.category,
+                    importance_score=ev.importance_score,
+                    is_breaking=ev.is_breaking,
+                    content=content,
+                    content_fa=content_fa,
+                    image_url=image_url,
                 )
-                for row in rows
-            ]
-        except (KeyError, IndexError):
-            return []
+                saved_count += 1
+                time.sleep(1)
 
+            except Exception as e:
+                logger.error(f"❌ خطا در پردازش خبر: {e}")
+                continue
 
-def get_client() -> TursoClient:
-    """ساخت client برای Turso."""
-    return TursoClient(
-        url=Config.TURSO_DATABASE_URL,
-        auth_token=Config.TURSO_AUTH_TOKEN,
-    )
+        logger.info(f"✅ {saved_count} خبر جدید ذخیره شد")
 
-
-# ============================================================
-# ساخت جدول
-# ============================================================
-def init_db():
-    """ساخت جدول‌های مورد نیاز در Turso."""
-    client = get_client()
-    
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            title_fa TEXT NOT NULL,
-            summary TEXT,
-            summary_fa TEXT,
-            content TEXT,
-            content_fa TEXT,
-            link TEXT NOT NULL,
-            normalized_link TEXT NOT NULL,
-            image_url TEXT,
-            source_name TEXT NOT NULL,
-            source_name_fa TEXT NOT NULL,
-            language TEXT NOT NULL,
-            category TEXT DEFAULT 'سیاسی',
-            importance_score INTEGER DEFAULT 5,
-            is_breaking INTEGER DEFAULT 0,
-            view_count INTEGER DEFAULT 0,
-            published_at TEXT,
-            created_at TEXT NOT NULL,
-            title_hash TEXT
-        )
-    """)
-    
-    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_link ON articles(normalized_link)")
-    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_slug ON articles(slug)")
-    client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_hash ON articles(title_hash)")
-    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)")
-    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC)")
-    client.execute("CREATE INDEX IF NOT EXISTS idx_articles_breaking ON articles(is_breaking, created_at DESC)")
-    
-    logger.info("✅ Turso database آماده است")
-
-
-# ============================================================
-# هش عنوان
-# ============================================================
-def _title_hash(title: str) -> str:
-    normalized = re.sub(r"[^\w\s]", "", title.lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
-
-
-# ============================================================
-# تشخیص تکراری
-# ============================================================
-def is_duplicate(item: NewsItem) -> tuple[bool, str]:
-    client = get_client()
-    
-    result = client.fetch_one(
-        "SELECT 1 FROM articles WHERE normalized_link = ? LIMIT 1",
-        [item.normalized_link]
-    )
-    if result:
-        return True, "URL تکراری"
-
-    t_hash = _title_hash(item.title_clean)
-    result = client.fetch_one(
-        "SELECT 1 FROM articles WHERE title_hash = ? LIMIT 1",
-        [t_hash]
-    )
-    if result:
-        return True, "عنوان تکراری"
-
-    return False, ""
-
-
-def filter_new_items(items: list[NewsItem]) -> list[NewsItem]:
-    url_seen = set()
-    hash_seen = set()
-    unique = []
-    for item in items:
-        url_key = item.normalized_link
-        hash_key = _title_hash(item.title_clean)
-        if url_key in url_seen or hash_key in hash_seen:
-            continue
-        url_seen.add(url_key)
-        hash_seen.add(hash_key)
-        unique.append(item)
-
-    new_items = []
-    for item in unique:
-        is_dup, reason = is_duplicate(item)
-        if not is_dup:
-            new_items.append(item)
-
-    logger.info(f"🔍 از {len(items)} خبر، {len(new_items)} تای جدید")
-    return new_items
-
-
-# ============================================================
-# ذخیره خبر
-# ============================================================
-def save_article(
-    item: NewsItem,
-    title_fa: str,
-    summary_fa: str,
-    category: str,
-    importance_score: int,
-    is_breaking: bool,
-    content: str = "",
-    content_fa: str = "",
-    image_url: str | None = None,
-) -> int | None:
-    try:
-        slug = generate_unique_slug(title_fa, item.title_clean)
-        client = get_client()
-        
-        client.execute("""
-            INSERT INTO articles (
-                slug, title, title_fa, summary, summary_fa,
-                content, content_fa, link, normalized_link, image_url,
-                source_name, source_name_fa, language, category,
-                importance_score, is_breaking, published_at, created_at, title_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            slug,
-            item.title_clean,
-            title_fa,
-            item.summary_clean or "",
-            summary_fa,
-            content,
-            content_fa,
-            item.link,
-            item.normalized_link,
-            image_url,
-            item.source_name,
-            item.source_name_fa,
-            item.language,
-            category,
-            importance_score,
-            1 if is_breaking else 0,
-            item.published.isoformat() if item.published else None,
-            datetime.now().isoformat(),
-            _title_hash(item.title_clean),
-        ])
-        
-        # گرفتن id آخرین رکورد
-        result = client.fetch_one("SELECT last_insert_rowid()")
-        article_id = result[0] if result else None
-        
-        logger.info(f"💾 ذخیره شد: {title_fa[:60]}... (id={article_id})")
-        return article_id
     except Exception as e:
-        logger.error(f"❌ خطا در ذخیره: {e}")
-        return None
+        logger.error(f"❌ خطا در crawl_cycle: {e}", exc_info=True)
 
 
-# ============================================================
-# پاکسازی محتوای اخبار قدیمی (فقط content و content_fa رو NULL می‌کنه)
-# ============================================================
-def cleanup_old_content(keep_recent: int = 100) -> int:
-    """پاک کردن content و content_fa برای اخبار قدیمی‌تر از N خبر آخر.
-    
-    این تابع:
-      - آخرین `keep_recent` خبر رو نگه می‌داره (content_fa می‌مونه)
-      - بقیه اخبار: content و content_fa NULL می‌شن
-      - عنوان، خلاصه، تصویر، دسته‌بندی همچنان باقی می‌مونن
-      - اخبار قدیمی روی سایت به صفحه منبع اصلی لینک می‌شن
-    
-    خروجی: تعداد ردیف‌هایی که content‌شون پاک شد
-    """
+def cleanup_cycle():
+    """پاکسازی اخبار قدیمی."""
     try:
-        client = get_client()
-        
-        # پیدا کردن created_at برای مرزی که آخرین 100 خبر از اون به بعد باشن
-        result = client.fetch_one(f"""
-            SELECT created_at FROM articles 
-            ORDER BY created_at DESC 
-            LIMIT 1 OFFSET {keep_recent}
-        """)
-        
-        if not result:
-            logger.info(f"📊 کمتر از {keep_recent} خبر در دیتابیس هست - پاکسازی نمی‌شه")
-            return 0
-        
-        cutoff_date = result[0]
-        
-        # شمردن اخباری که content دارن و قدیمی‌تر از این تاریخن
-        count_result = client.fetch_one("""
-            SELECT COUNT(*) FROM articles 
-            WHERE created_at < ? 
-              AND (content IS NOT NULL OR content_fa IS NOT NULL)
-              AND (content != '' OR content_fa != '')
-        """, [cutoff_date])
-        
-        affected = int(count_result[0]) if count_result else 0
-        
-        if affected == 0:
-            logger.info(f"✅ نیازی به پاکسازی نیست - همه محتواها به‌روزن")
-            return 0
-        
-        # NULL کردن content برای اخبار قدیمی
-        client.execute("""
-            UPDATE articles 
-            SET content = NULL, content_fa = NULL 
-            WHERE created_at < ?
-              AND (content IS NOT NULL OR content_fa IS NOT NULL)
-        """, [cutoff_date])
-        
-        logger.info(f"🧹 محتوای {affected} خبر قدیمی پاک شد (آخرین {keep_recent} خبر حفظ شد)")
-        return affected
-        
+        # 1. پاک کردن content و content_fa برای اخبار قدیمی‌تر از 100 خبر آخر
+        #    → اخبار قدیمی روی سایت به منبع اصلی لینک می‌شن (نه صفحه داخلی)
+        logger.info("🧹 شروع پاکسازی محتوای اخبار قدیمی...")
+        cleanup_old_content(keep_recent=100)
+
+        # 2. حذف کامل اخبار خیلی قدیمی (بیش از 60 روز) از دیتابیس
+        logger.info("🗑 حذف اخبار قدیمی‌تر از 60 روز...")
+        cleanup_old_articles(keep_days=60)
+
     except Exception as e:
-        logger.error(f"❌ خطا در cleanup_old_content: {e}")
-        return 0
+        logger.error(f"❌ خطا در cleanup: {e}")
 
 
-# ============================================================
-# پاکسازی کامل (حذف اخبار خیلی قدیمی از دیتابیس)
-# ============================================================
-def cleanup_old_articles(keep_days: int = 60) -> int:
-    cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-    client = get_client()
-    client.execute("DELETE FROM articles WHERE created_at < ?", [cutoff])
-    return 0
+def run_once():
+    """اجرای یکباره (برای cron)."""
+    errors = Config.validate()
+    if errors:
+        for e in errors:
+            logger.error(f"❌ {e}")
+        sys.exit(1)
+
+    init_db()
+    crawl_cycle()
+
+    # 5% احتمال اجرای cleanup در هر cron run
+    # (چون cron هر 30 دقیقه اجرا میشه → تقریباً روزی 2-3 بار cleanup)
+    import random
+    if random.random() < 0.05:
+        cleanup_cycle()
+
+    stats = get_stats()
+    logger.info(
+        f"📊 آمار: کل={stats['total']} | فوری={stats['breaking']} | "
+        f"امروز={stats['today']} | با‌محتوا={stats.get('with_content', 0)}"
+    )
 
 
-# ============================================================
-# آمار
-# ============================================================
-def get_stats() -> dict:
-    client = get_client()
-    total = client.fetch_one("SELECT COUNT(*) FROM articles")
-    breaking = client.fetch_one("SELECT COUNT(*) FROM articles WHERE is_breaking = 1")
-    today = client.fetch_one("SELECT COUNT(*) FROM articles WHERE date(created_at) = date('now')")
-    with_content = client.fetch_one("SELECT COUNT(*) FROM articles WHERE content_fa IS NOT NULL AND content_fa != ''")
-    
-    return {
-        "total": int(total[0]) if total else 0,
-        "breaking": int(breaking[0]) if breaking else 0,
-        "today": int(today[0]) if today else 0,
-        "with_content": int(with_content[0]) if with_content else 0,
-    }
+def run_scheduler():
+    """اجرای مداوم با scheduler."""
+    errors = Config.validate()
+    if errors:
+        for e in errors:
+            logger.error(f"❌ {e}")
+        sys.exit(1)
+
+    init_db()
+    stats = get_stats()
+    logger.info(f"📊 آمار اولیه: {stats}")
+
+    scheduler = BackgroundScheduler(timezone="UTC")
+
+    # crawl هر N دقیقه
+    scheduler.add_job(
+        crawl_cycle,
+        IntervalTrigger(minutes=Config.CHECK_INTERVAL_MINUTES),
+        next_run_time=datetime.now(),
+    )
+
+    # cleanup هر 24 ساعت
+    scheduler.add_job(cleanup_cycle, IntervalTrigger(hours=24))
+
+    scheduler.start()
+
+    logger.info(
+        f"🚀 پالیز نیوز شروع شد - هر {Config.CHECK_INTERVAL_MINUTES} دقیقه چک می‌کند"
+    )
+    logger.info("🧹 پاکسازی خودکار: هر 24 ساعت (نگهداری 100 خبر آخر با محتوا)")
+
+    try:
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown(wait=False)
+        logger.info("🛑 توقف شد")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    init_db()
-    stats = get_stats()
-    print(f"📊 آمار: {stats}")
+    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        run_once()
+    else:
+        run_scheduler()
