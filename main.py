@@ -67,13 +67,26 @@ def crawl_cycle():
                     logger.debug(f"⏭ نامرتبط: {item.title_clean[:50]}")
                     continue
 
-                # scrape محتوای کامل
+                # استخراج تصویر و محتوا
                 content = ""
                 content_fa = ""
                 image_url = None
+                
+                # اولویت 1: تصویر از RSS
+                if hasattr(item, 'image_url') and item.image_url:
+                    image_url = item.image_url
+                    logger.debug(f"📷 تصویر از RSS: {image_url[:60]}")
+                
+                # scrape محتوای کامل (و تصویر اگر RSS نداشت)
                 if Config.SCRAPE_FULL_CONTENT:
-                    content, image_url = scrape_article_content(item.link)
-                    # ترجمه محتوا اگه انگلیسی بود (فقط ۲۰۰۰ کاراکتر اول برای صرفه‌جویی)
+                    content, scraped_image = scrape_article_content(item.link)
+                    
+                    # اگر عکس RSS نداشت، از عکس scrape شده استفاده کن
+                    if not image_url and scraped_image:
+                        image_url = scraped_image
+                        logger.debug(f"📷 تصویر از scrape: {image_url[:60]}")
+                    
+                    # ترجمه محتوا اگه انگلیسی بود
                     if content and item.language == "en":
                         try:
                             content_fa = translate_to_persian(content[:2000])
@@ -95,7 +108,7 @@ def crawl_cycle():
                     image_url=image_url,
                 )
                 saved_count += 1
-                time.sleep(1)  # ملاحظه سرورها
+                time.sleep(1)
             except Exception as e:
                 logger.error(f"❌ خطا در پردازش خبر: {e}")
                 continue
@@ -125,7 +138,7 @@ def run_once():
     crawl_cycle()
 
     import random
-    if random.random() < 0.05:  # ~5% مواقع
+    if random.random() < 0.05:
         cleanup_cycle()
 
     stats = get_stats()
