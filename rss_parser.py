@@ -5,16 +5,17 @@
 
 وظایف:
   1. دریافت فید از هر منبع (با timeout و retry ساده)
-  2. استخراج فیلدهای خبر (عنوان، لینک، خلاصه، تاریخ، منبع)
+  2. استخراج فیلدهای خبر (عنوان، لینک، خلاصه، تاریخ، منبع، تصویر)
   3. نرمال‌سازی URL برای جلوگیری از تکرار
   4. فیلتر اولیه با کلمات کلیدی (برای کاهش حجم قبل از هوش مصنوعی)
   5. فیلتر سن خبر (حذف اخبار قدیمی‌تر از MAX_NEWS_AGE_HOURS ساعت)
 """
 import logging
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse, parse_qs
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import httpx
@@ -28,23 +29,22 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NewsItem:
     """نمایانگر یک خبر خام از RSS."""
-    title: str               # عنوان خبر
-    link: str                # لینک اصلی خبر
-    summary: str             # خلاصه (HTML یا متن)
-    source_name: str         # نام منبع (مثلاً BBC Persian)
-    source_name_fa: str      # نام فارسی منبع
-    language: str            # fa یا en
-    priority: str            # breaking یا normal
-    published: datetime | None  # زمان انتشار (در صورت وجود)
-    fetched_at: datetime     # زمان دریافت توسط ربات
+    title: str
+    link: str
+    summary: str
+    source_name: str
+    source_name_fa: str
+    language: str
+    priority: str
+    published: datetime | None
+    fetched_at: datetime
+    image_url: str | None = None
 
     @property
     def normalized_link(self) -> str:
-        """URL نرمال‌شده برای مقایسه تکراری.
-        بخش‌های ردیابی (query params) و fragment حذف می‌شوند."""
+        """URL نرمال‌شده برای مقایسه تکراری."""
         try:
             parsed = urlparse(self.link)
-            # حذف query string و fragment
             clean = parsed._replace(query="", fragment="")
             return urlunparse(clean).rstrip("/")
         except Exception:
@@ -52,16 +52,9 @@ class NewsItem:
 
     @property
     def title_clean(self) -> str:
-        """عنوان پاک‌سازی شده.
-        پسوندهای منبع که در RSS معمول است (مثل '- Devdiscourse', '| Reuters') حذف می‌شوند."""
-        import re
+        """عنوان پاک‌سازی شده."""
         title = self.title.strip()
-
-        # حذف پسوندهای رایج منبع با الگوهای "- نام منبع" یا "| نام منبع" در انتها
-        # این الگو هر متن بعد از " - " یا " | " در انتها را حذف می‌کند
         title = re.sub(r"\s*[-–|]\s*[\w\s\.]+$", "", title).strip()
-
-        # حذف پسوندهای مشخص و رایج
         suffixes = [
             " - BBC News", " - BBC Persian", " - Reuters", " - AP News",
             " - Al Jazeera", " - The Guardian", " | Reuters", " | AP News",
@@ -70,17 +63,14 @@ class NewsItem:
         for s in suffixes:
             if title.endswith(s):
                 title = title[: -len(s)].strip()
-
         return title
 
     @property
     def summary_clean(self) -> str:
-        """خلاصه پاک‌سازی شده.
-        اگر خلاصه دقیقاً همان عنوان باشد (مشکل رایج Google News)، خالی برمی‌گرداند."""
+        """خلاصه پاک‌سازی شده."""
         summary = _strip_html(self.summary)
         if not summary:
             return ""
-        # اگر خلاصه با عنوان یکی است یا تقریباً یکی است، خالی برگردان
         if (summary.lower() == self.title_clean.lower()
                 or self.title_clean.lower() in summary.lower()):
             return ""
@@ -94,7 +84,6 @@ def fetch_feed(source: Source, timeout: int = 15) -> list[NewsItem]:
     """یک فید RSS را دریافت کرده و لیست NewsItem برمی‌گرداند."""
     items: list[NewsItem] = []
     try:
-        # استفاده از httpx برای timeout کنترل‌شده
         headers = {
             "User-Agent": "IranNewsBot/1.0 (+https://github.com/yourrepo)"
         }
@@ -103,7 +92,6 @@ def fetch_feed(source: Source, timeout: int = 15) -> list[NewsItem]:
             response.raise_for_status()
             content = response.content
 
-        # پارس فید با feedparser
         feed = feedparser.parse(content)
 
         if feed.bozo and not feed.entries:
@@ -115,29 +103,28 @@ def fetch_feed(source: Source, timeout: int = 15) -> list[NewsItem]:
                 title = entry.get("title", "").strip()
                 link = entry.get("link", "").strip()
                 summary = entry.get("summary", entry.get("description", "")).strip()
-
-                # حذف تگ‌های HTML ساده از خلاصه
                 summary = _strip_html(summary)
 
                 if not title or not link:
                     continue
 
-                # استخراج منبع واقعی از Google News (به جای "Google News")
                 real_source_name, real_source_fa = _extract_real_source(entry, source)
-
-                # پارس تاریخ انتشار
                 published = _parse_date(entry)
+                
+                # استخراج تصویر از RSS
+                rss_image = _extract_rss_image(entry)
 
                 items.append(NewsItem(
                     title=title,
                     link=link,
-                    summary=summary[:500],  # محدود کردن طول خلاصه
+                    summary=summary[:500],
                     source_name=real_source_name,
                     source_name_fa=real_source_fa,
                     language=source.language,
                     priority=source.priority,
                     published=published,
                     fetched_at=datetime.now(),
+                    image_url=rss_image,
                 ))
             except Exception as e:
                 logger.debug(f"خطا در پارس یک entry از {source.name}: {e}")
@@ -156,8 +143,7 @@ def fetch_feed(source: Source, timeout: int = 15) -> list[NewsItem]:
 # فیلتر اولیه با کلمات کلیدی
 # ============================================================
 def keyword_filter(item: NewsItem) -> bool:
-    """بررسی می‌کند که آیا خبر مرتبط با ایران است یا خیر.
-    این فیلتر سریع است و حجم اخبار را قبل از ارسال به AI کاهش می‌دهد."""
+    """بررسی می‌کند که آیا خبر مرتبط با ایران است یا خیر."""
     text = f"{item.title} {item.summary}".lower()
 
     if item.language == "en":
@@ -169,18 +155,97 @@ def keyword_filter(item: NewsItem) -> bool:
 
 
 # ============================================================
+# استخراج تصویر از RSS
+# ============================================================
+def _extract_rss_image(entry) -> str | None:
+    """استخراج تصویر از RSS entry.
+    چک می‌کند: media_content, media_thumbnail, enclosure, links."""
+    
+    # روش 1: media_content (رایج در Google News)
+    media_content = entry.get("media_content", [])
+    if media_content:
+        for media in media_content:
+            url = media.get("url", "")
+            media_type = media.get("type", "")
+            if url and ("image" in media_type or _looks_like_image(url)):
+                if not _is_bad_rss_image(url):
+                    return url
+    
+    # روش 2: media_thumbnail
+    media_thumbnails = entry.get("media_thumbnail", [])
+    if media_thumbnails:
+        for thumb in media_thumbnails:
+            url = thumb.get("url", "")
+            if url and not _is_bad_rss_image(url):
+                return url
+    
+    # روش 3: enclosure
+    enclosures = entry.get("enclosures", [])
+    if enclosures:
+        for enc in enclosures:
+            url = enc.get("href", enc.get("url", ""))
+            enc_type = enc.get("type", "")
+            if url and ("image" in enc_type or _looks_like_image(url)):
+                if not _is_bad_rss_image(url):
+                    return url
+    
+    # روش 4: links با type image
+    links = entry.get("links", [])
+    for link_item in links:
+        link_type = link_item.get("type", "")
+        link_url = link_item.get("href", "")
+        if "image" in link_type and link_url:
+            if not _is_bad_rss_image(link_url):
+                return link_url
+    
+    # روش 5: تصویر داخل summary HTML
+    summary = entry.get("summary", "")
+    if summary:
+        img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
+        if img_match:
+            img_url = img_match.group(1)
+            if not _is_bad_rss_image(img_url):
+                return img_url
+    
+    return None
+
+
+def _looks_like_image(url: str) -> bool:
+    """آیا URL شبیه یک تصویر هست."""
+    url_lower = url.lower()
+    return any(url_lower.endswith(ext) for ext in [
+        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"
+    ]) or any(keyword in url_lower for keyword in [
+        "image", "img", "photo", "picture", "thumb", "media"
+    ])
+
+
+def _is_bad_rss_image(url: str) -> bool:
+    """آیا تصویر ناخواسته هست (لوگو، آیکون و ...)."""
+    if not url:
+        return True
+    
+    url_lower = url.lower()
+    bad_patterns = [
+        "logo", "icon", "favicon", "avatar",
+        "1x1", "pixel", "spacer", "blank",
+        "gstatic.com/images/branding",
+        "google.com/logos",
+        ".svg",
+    ]
+    return any(p in url_lower for p in bad_patterns)
+
+
+# ============================================================
 # توابع کمکی
 # ============================================================
-# نگاشت نام منابع انگلیسی به فارسی (برای نمایش در کانال)
 _SOURCE_NAME_FA = {
-    # منابع اصلی
     "BBC Persian": "بی‌بی‌سی فارسی", "BBC News": "بی‌بی‌سی",
     "Reuters": "رویترز", "AP News": "آسوشیتدپرس", "AP": "آسوشیتدپرس",
     "Al Jazeera": "الجزیره", "The Guardian": "گاردین",
     "Iran International": "ایران اینترنشنال", "Radio Farda": "رادیو فردا",
     "VOA Persian": "صدای آمریکا", "Deutsche Welle FA": "دویچه وله",
     "DW": "دویچه وله", "Etemad Online": "اعتماد",
-    # منابع بین‌المللی پرتکرار Google News
     "WSJ": "وال‌استریت ژورنال", "Wall Street Journal": "وال‌استریت ژورنال",
     "NYTimes": "نیویورک تایمز", "New York Times": "نیویورک تایمز",
     "The New York Times": "نیویورک تایمز",
@@ -207,27 +272,20 @@ _SOURCE_NAME_FA = {
 
 
 def _extract_real_source(entry, source: Source) -> tuple[str, str]:
-    """استخراج منبع واقعی خبر از Google News.
-    Google News در فیلد 'source' اطلاعات منبع اصلی را می‌دهد.
-    خروجی: (نام انگلیسی، نام فارسی)"""
-    # 1. تلاش با فیلد source در entry (روش اصلی Google News)
+    """استخراج منبع واقعی خبر از Google News."""
     src = entry.get("source")
     if src and isinstance(src, dict):
         title = src.get("title", "").strip()
         if title:
             return title, _SOURCE_NAME_FA.get(title, title)
 
-    # 2. اگر منبع Google News نیست، از source اصلی فید استفاده کن
     if "Google News" not in source.name:
         return source.name, source.display_name
 
-    # 3. تلاش با استخراج از URL منبع
     href = (src or {}).get("href", "") if src else ""
     if href:
         try:
-            from urllib.parse import urlparse
             domain = urlparse(href).netloc.replace("www.", "")
-            # تبدیل domain به نام نمایشی
             domain_names = {
                 "reuters.com": "Reuters", "apnews.com": "AP News",
                 "bbc.com": "BBC News", "bbc.co.uk": "BBC News",
@@ -245,28 +303,16 @@ def _extract_real_source(entry, source: Source) -> tuple[str, str]:
 
 
 def _strip_html(text: str) -> str:
-    """حذف تگ‌های HTML و entity ها از متن.
-    نمونه‌هایی که پاک می‌شوند: <b>...</b>, &nbsp;, &amp;, &#8230; و ..."""
-    import re
+    """حذف تگ‌های HTML و entity ها از متن."""
     import html
-
+    
     if not text:
         return ""
 
-    # 1. ابتدا entity های HTML را به کاراکتر واقعی تبدیل کن
-    # این کار &nbsp; را به فضای غیرشکن (U+00A0) و &amp; را به & تبدیل می‌کند
     text = html.unescape(text)
-
-    # 2. حذف تگ‌های HTML
     text = re.sub(r"<[^>]+>", "", text)
-
-    # 3. جایگزینی فضای غیرشکن (nbsp) با فاصله معمولی
     text = text.replace("\xa0", " ")
-
-    # 4. حذف کاراکترهای کنترلی و فاصله‌های صفر-عرض
     text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
-
-    # 5. فشرده‌سازی چندین فاصله پشت سر هم به یک فاصله
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
@@ -274,9 +320,8 @@ def _strip_html(text: str) -> str:
 
 def _parse_date(entry) -> datetime | None:
     """پارس تاریخ انتشار از entry RSS."""
-    # feedparser معمولاً struct_time در entry.published_parsed می‌دهد
-    for field in ["published_parsed", "updated_parsed", "created_parsed"]:
-        t = entry.get(field)
+    for field_name in ["published_parsed", "updated_parsed", "created_parsed"]:
+        t = entry.get(field_name)
         if t:
             try:
                 return datetime(*t[:6])
@@ -289,13 +334,10 @@ def _parse_date(entry) -> datetime | None:
 # فیلتر سن خبر
 # ============================================================
 def age_filter(item: NewsItem, max_age_hours: int | None = None) -> bool:
-    """بررسی می‌کند که آیا خبر جدید است یا قدیمی.
-    اگر published مشخص نباشد، خبر نگه داشته می‌شود (محتاطانه)."""
+    """بررسی می‌کند که آیا خبر جدید است یا قدیمی."""
     if max_age_hours is None:
         max_age_hours = Config.MAX_NEWS_AGE_HOURS
 
-    # اگر زمان انتشار موجود نیست، خبر را نگه می‌داریم
-    # (ممکن است از RSS گرفته نشده باشد ولی واقعاً جدید باشد)
     if item.published is None:
         return True
 
@@ -307,21 +349,17 @@ def age_filter(item: NewsItem, max_age_hours: int | None = None) -> bool:
 # توابع عمومی
 # ============================================================
 def fetch_all_news(only_breaking: bool = False, timeout: int = 15) -> list[NewsItem]:
-    """همه اخبار از همه منابع را دریافت می‌کند.
-    اگر only_breaking=True باشد، فقط منابع خبر فوری چک می‌شوند.
-    اخبار قدیمی‌تر از MAX_NEWS_AGE_HOURS ساعت فیلتر می‌شوند."""
+    """همه اخبار از همه منابع را دریافت می‌کند."""
     sources = get_breaking_sources() if only_breaking else get_all_sources()
     all_items: list[NewsItem] = []
 
     for source in sources:
         items = fetch_feed(source, timeout=timeout)
-        # فیلتر کلمات کلیدی + فیلتر سن خبر
         filtered = [
             item for item in items
             if keyword_filter(item) and age_filter(item)
         ]
         all_items.extend(filtered)
-        # مکث کوتاه برای محترم شمردن سرورها
         time.sleep(0.3)
 
     logger.info(
@@ -366,5 +404,7 @@ if __name__ == "__main__":
     print(f"\n📌 {len(news)} خبر مرتبط با ایران پیدا شد:\n")
     for i, item in enumerate(news[:10], 1):
         icon = "🚨" if item.priority == "breaking" else "📰"
+        img_status = "✅" if item.image_url else "❌"
         print(f"{i}. {icon} [{item.source_name}] {item.title_clean}")
+        print(f"   📷 {img_status} تصویر: {item.image_url[:60] if item.image_url else 'ندارد'}")
         print(f"   🔗 {item.normalized_link}\n")
