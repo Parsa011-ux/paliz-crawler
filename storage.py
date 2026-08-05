@@ -268,7 +268,67 @@ def save_article(
 
 
 # ============================================================
-# پاکسازی
+# پاکسازی محتوای اخبار قدیمی (فقط content و content_fa رو NULL می‌کنه)
+# ============================================================
+def cleanup_old_content(keep_recent: int = 100) -> int:
+    """پاک کردن content و content_fa برای اخبار قدیمی‌تر از N خبر آخر.
+    
+    این تابع:
+      - آخرین `keep_recent` خبر رو نگه می‌داره (content_fa می‌مونه)
+      - بقیه اخبار: content و content_fa NULL می‌شن
+      - عنوان، خلاصه، تصویر، دسته‌بندی همچنان باقی می‌مونن
+      - اخبار قدیمی روی سایت به صفحه منبع اصلی لینک می‌شن
+    
+    خروجی: تعداد ردیف‌هایی که content‌شون پاک شد
+    """
+    try:
+        client = get_client()
+        
+        # پیدا کردن created_at برای مرزی که آخرین 100 خبر از اون به بعد باشن
+        result = client.fetch_one(f"""
+            SELECT created_at FROM articles 
+            ORDER BY created_at DESC 
+            LIMIT 1 OFFSET {keep_recent}
+        """)
+        
+        if not result:
+            logger.info(f"📊 کمتر از {keep_recent} خبر در دیتابیس هست - پاکسازی نمی‌شه")
+            return 0
+        
+        cutoff_date = result[0]
+        
+        # شمردن اخباری که content دارن و قدیمی‌تر از این تاریخن
+        count_result = client.fetch_one("""
+            SELECT COUNT(*) FROM articles 
+            WHERE created_at < ? 
+              AND (content IS NOT NULL OR content_fa IS NOT NULL)
+              AND (content != '' OR content_fa != '')
+        """, [cutoff_date])
+        
+        affected = int(count_result[0]) if count_result else 0
+        
+        if affected == 0:
+            logger.info(f"✅ نیازی به پاکسازی نیست - همه محتواها به‌روزن")
+            return 0
+        
+        # NULL کردن content برای اخبار قدیمی
+        client.execute("""
+            UPDATE articles 
+            SET content = NULL, content_fa = NULL 
+            WHERE created_at < ?
+              AND (content IS NOT NULL OR content_fa IS NOT NULL)
+        """, [cutoff_date])
+        
+        logger.info(f"🧹 محتوای {affected} خبر قدیمی پاک شد (آخرین {keep_recent} خبر حفظ شد)")
+        return affected
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در cleanup_old_content: {e}")
+        return 0
+
+
+# ============================================================
+# پاکسازی کامل (حذف اخبار خیلی قدیمی از دیتابیس)
 # ============================================================
 def cleanup_old_articles(keep_days: int = 60) -> int:
     cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
@@ -285,11 +345,13 @@ def get_stats() -> dict:
     total = client.fetch_one("SELECT COUNT(*) FROM articles")
     breaking = client.fetch_one("SELECT COUNT(*) FROM articles WHERE is_breaking = 1")
     today = client.fetch_one("SELECT COUNT(*) FROM articles WHERE date(created_at) = date('now')")
+    with_content = client.fetch_one("SELECT COUNT(*) FROM articles WHERE content_fa IS NOT NULL AND content_fa != ''")
     
     return {
         "total": int(total[0]) if total else 0,
         "breaking": int(breaking[0]) if breaking else 0,
         "today": int(today[0]) if today else 0,
+        "with_content": int(with_content[0]) if with_content else 0,
     }
 
 
