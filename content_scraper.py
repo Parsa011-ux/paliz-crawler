@@ -2,7 +2,7 @@
 استخراج محتوای کامل خبر از URL منبع
 ======================================
 از BeautifulSoup برای استخراج متن اصلی و تصویر مقاله استفاده می‌کند.
-پشتیبانی از Google News redirect و استخراج تصاویر معتبر.
+پشتیبانی از Google News با googlenewsdecoder.
 """
 import logging
 import re
@@ -12,6 +12,14 @@ import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# تلاش برای import کردن googlenewsdecoder
+try:
+    from googlenewsdecoder import gnewsdecoder
+    HAS_GNEWS_DECODER = True
+except ImportError:
+    HAS_GNEWS_DECODER = False
+    logger.warning("googlenewsdecoder نصب نیست - استفاده از روش fallback")
 
 CONTENT_SELECTORS = [
     "article",
@@ -50,7 +58,8 @@ def scrape_article_content(url: str, timeout: int = 20) -> tuple[str, str | None
     خروجی: (متن مقاله, URL تصویر)
     """
     try:
-        real_url = _resolve_google_news_url(url, timeout)
+        # اگر URL از Google News بود، اول Decode کن
+        real_url = _decode_google_news_url(url, timeout)
         
         with httpx.Client(
             timeout=timeout, 
@@ -81,11 +90,25 @@ def scrape_article_content(url: str, timeout: int = 20) -> tuple[str, str | None
         return "", None
 
 
-def _resolve_google_news_url(url: str, timeout: int = 15) -> str:
-    """اگر URL از Google News باشه، لینک واقعی مقاله رو پیدا می‌کنه."""
+def _decode_google_news_url(url: str, timeout: int = 15) -> str:
+    """
+    Decode کردن URL های Google News با googlenewsdecoder.
+    """
     if "news.google.com" not in url:
         return url
     
+    # روش 1: استفاده از googlenewsdecoder
+    if HAS_GNEWS_DECODER:
+        try:
+            result = gnewsdecoder(url, interval=1)
+            if result.get("status") and result.get("decoded_url"):
+                decoded = result["decoded_url"]
+                logger.debug(f"✅ Google News decoded: {decoded[:60]}")
+                return decoded
+        except Exception as e:
+            logger.debug(f"googlenewsdecoder error: {e}")
+    
+    # روش 2 (fallback): تلاش با httpx redirect
     try:
         with httpx.Client(
             timeout=timeout,
@@ -95,52 +118,12 @@ def _resolve_google_news_url(url: str, timeout: int = 15) -> str:
             response = client.get(url)
             final_url = str(response.url)
             
-            if "news.google.com" in final_url:
-                soup = BeautifulSoup(response.text, "lxml")
-                
-                # Meta refresh
-                meta_refresh = soup.find("meta", attrs={"http-equiv": "refresh"})
-                if meta_refresh and meta_refresh.get("content"):
-                    content = meta_refresh["content"]
-                    match = re.search(r'url=([^"\'>\s]+)', content, re.IGNORECASE)
-                    if match:
-                        return match.group(1)
-                
-                # Canonical link
-                canonical = soup.find("link", rel="canonical")
-                if canonical and canonical.get("href"):
-                    href = canonical["href"]
-                    if "news.google.com" not in href:
-                        return href
-                
-                # JavaScript redirect
-                for script in soup.find_all("script"):
-                    if script.string:
-                        match = re.search(
-                            r'window\.location\.replace\(["\']([^"\']+)["\']',
-                            script.string
-                        )
-                        if match:
-                            return match.group(1)
-                        
-                        match = re.search(
-                            r'"(https?://(?!news\.google\.com)[^"]+)"',
-                            script.string
-                        )
-                        if match:
-                            return match.group(1)
-                
-                # Article links
-                article_link = soup.find("a", attrs={"data-n-tid": True})
-                if article_link and article_link.get("href"):
-                    href = article_link["href"]
-                    if href.startswith("http") and "news.google.com" not in href:
-                        return href
-            
-            return final_url
-    except Exception as e:
-        logger.debug(f"نتوانستم Google News URL رو حل کنم: {e}")
-        return url
+            if "news.google.com" not in final_url:
+                return final_url
+    except Exception:
+        pass
+    
+    return url
 
 
 def _extract_main_image(soup: BeautifulSoup, base_url: str = "") -> str | None:
